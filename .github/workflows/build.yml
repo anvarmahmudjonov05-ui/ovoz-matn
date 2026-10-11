@@ -11,13 +11,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install -r requirements.txt pyinstaller huggingface_hub
-      - run: python yuklab_model.py
+      - run: pip install -r requirements.txt pyinstaller
       - run: >
           pyinstaller --noconfirm --onefile --noconsole --name OvozMatn
-          --add-data "model;model"
-          --collect-all faster_whisper --collect-all ctranslate2 --collect-all av
-          --collect-all onnxruntime --collect-all sounddevice --collect-all _sounddevice_data
+          --collect-all speech_recognition --collect-all sounddevice --collect-all _sounddevice_data
           ovoz_matn.py
       - uses: actions/upload-artifact@v4
         with:
