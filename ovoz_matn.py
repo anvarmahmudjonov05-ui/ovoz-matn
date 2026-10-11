@@ -69,6 +69,9 @@ CONFIG_PATH = os.path.join(LOG_DIR, "sozlamalar.json")
 DEFAULT_CONFIG = {
     "elevenlabs_api_key": "",
     "elevenlabs_til": "uzb",
+    "groq_api_key": "",
+    "groq_model": "whisper-large-v3",
+    "groq_til": "uz",
 }
 
 
@@ -79,7 +82,11 @@ def load_config():
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(DEFAULT_CONFIG, f, indent=2, ensure_ascii=False)
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            cfg.update(json.load(f))
+            saved = json.load(f)
+        cfg.update(saved)
+        if any(k not in saved for k in DEFAULT_CONFIG):  # yangi sozlamalarni faylga qo'shib qo'yish
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2, ensure_ascii=False)
     except Exception:
         log("Sozlamalarni o'qib bo'lmadi:\n" + traceback.format_exc())
     return cfg
@@ -113,6 +120,19 @@ def elevenlabs_text(pcm_bytes, api_key, lang):
     )
     if r.status_code != 200:
         raise RuntimeError(f"ElevenLabs {r.status_code}: {r.text[:300]}")
+    return r.json().get("text", "").strip()
+
+
+def groq_text(pcm_bytes, api_key, model, lang):
+    r = requests.post(
+        "https://api.groq.com/openai/v1/audio/transcriptions",
+        headers={"Authorization": f"Bearer {api_key}"},
+        files={"file": ("audio.wav", pcm_to_wav(pcm_bytes), "audio/wav")},
+        data={"model": model, "language": lang, "response_format": "json", "temperature": "0"},
+        timeout=30,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"Groq {r.status_code}: {r.text[:300]}")
     return r.json().get("text", "").strip()
 
 
@@ -156,6 +176,7 @@ ICON_BUSY = make_icon("orange")
 ICON_IDLE = make_icon("green")
 ICON_REC = make_icon("red")
 ICON_EL = make_icon("royalblue")
+ICON_GROQ = make_icon("purple")
 READY = "Tayyor: Ctrl+Shift ni ushlab gapiring"
 
 
@@ -167,6 +188,7 @@ class VoiceTyper:
         self.started_at = 0.0
         self.lock = threading.Lock()
         self.last_engine = None
+        self.fallback_note = ""
         self.recognizer = sr.Recognizer()
         self.tray = pystray.Icon(
             "ovoz_matn",
@@ -179,32 +201,32 @@ class VoiceTyper:
                     self.toggle_autostart,
                     checked=lambda item: autostart_enabled(),
                 ),
-                pystray.MenuItem("Sozlamalar (ElevenLabs kalit)", lambda icon, item: open_config()),
+                pystray.MenuItem("Sozlamalar (API kalitlar)", lambda icon, item: open_config()),
                 pystray.MenuItem("Chiqish", self.quit),
             ),
         )
 
     def configured_engine(self):
-        key = (load_config().get("elevenlabs_api_key") or "").strip()
-        return "ElevenLabs" if key else "Google"
+        cfg = load_config()
+        if (cfg.get("elevenlabs_api_key") or "").strip():
+            return "ElevenLabs"
+        if (cfg.get("groq_api_key") or "").strip():
+            return "Groq"
+        return "Google"
 
     def engine_text(self):
-        cur = self.configured_engine()
-        txt = f"Ishlayapti: {cur}"
-        if self.last_engine and self.last_engine != cur:
-            txt += f" (oxirgi matn: {self.last_engine})"
-        elif self.last_engine == "Google (zaxira)":
-            txt = "Oxirgi matn: Google (ElevenLabs ishlamadi)"
+        txt = f"Ishlayapti: {self.configured_engine()}"
+        if self.last_engine:
+            txt += f" | oxirgi matn: {self.last_engine}"
         return txt
 
     def idle(self):
         eng = self.configured_engine()
-        if self.last_engine == "Google (zaxira)":
-            self.set_state(ICON_BUSY, "ElevenLabs ishlamadi -> Google ishlatildi")
-        elif eng == "ElevenLabs":
-            self.set_state(ICON_EL, "Tayyor [ElevenLabs]: Ctrl+Shift ni ushlab gapiring")
-        else:
-            self.set_state(ICON_IDLE, "Tayyor [Google]: Ctrl+Shift ni ushlab gapiring")
+        if self.fallback_note:
+            self.set_state(ICON_BUSY, self.fallback_note)
+            return
+        icon = {"ElevenLabs": ICON_EL, "Groq": ICON_GROQ}.get(eng, ICON_IDLE)
+        self.set_state(icon, f"Tayyor [{eng}]: Ctrl+Shift ni ushlab gapiring")
 
     def set_state(self, icon, title):
         self.tray.icon = icon
@@ -270,38 +292,61 @@ class VoiceTyper:
         self.set_state(ICON_BUSY, "Matnga o'girilmoqda...")
         try:
             pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
-            text = ""
             cfg = load_config()
-            key = (cfg.get("elevenlabs_api_key") or "").strip()
-            done = False
-            if key:
+            engines = []
+            if (cfg.get("elevenlabs_api_key") or "").strip():
+                engines.append("ElevenLabs")
+            if (cfg.get("groq_api_key") or "").strip():
+                engines.append("Groq")
+            engines.append("Google")
+
+            text, used = "", None
+            for name in engines:
                 try:
-                    text = elevenlabs_text(pcm, key, cfg.get("elevenlabs_til") or "uzb")
-                    done = True
-                    self.last_engine = "ElevenLabs"
+                    if name == "ElevenLabs":
+                        text = elevenlabs_text(
+                            pcm, cfg["elevenlabs_api_key"].strip(), cfg.get("elevenlabs_til") or "uzb"
+                        )
+                    elif name == "Groq":
+                        text = groq_text(
+                            pcm,
+                            cfg["groq_api_key"].strip(),
+                            cfg.get("groq_model") or "whisper-large-v3",
+                            cfg.get("groq_til") or "uz",
+                        )
+                    else:
+                        data = sr.AudioData(pcm, SAMPLE_RATE, 2)
+                        text = self.recognizer.recognize_google(data, language=LANGUAGE).strip()
+                    used = name
+                    break
+                except sr.UnknownValueError:
+                    used, text = name, ""
+                    break
                 except Exception:
-                    log("ElevenLabs xatosi, Google ishlatiladi:\n" + traceback.format_exc())
-                    try:
-                        self.tray.notify("ElevenLabs ishlamadi (kalit/internet?). Google ishlatildi.", "OvozMatn")
-                    except Exception:
-                        pass
-            if not done:
-                self.last_engine = "Google (zaxira)" if key else "Google"
-                data = sr.AudioData(pcm, SAMPLE_RATE, 2)
-                text = self.recognizer.recognize_google(data, language=LANGUAGE).strip()
+                    log(f"{name} xatosi:\n" + traceback.format_exc())
+
+            if used is None:
+                self.fallback_note = "Hech bir xizmat javob bermadi (internet?)"
+                try:
+                    self.tray.notify("Hech bir xizmat javob bermadi. Internetni tekshiring.", "OvozMatn")
+                except Exception:
+                    pass
+                self.idle()
+                return
+
+            self.last_engine = used
+            main = self.configured_engine()
+            if used != main:
+                self.fallback_note = f"{main} ishlamadi -> {used} ishlatildi"
+                try:
+                    self.tray.notify(self.fallback_note, "OvozMatn")
+                except Exception:
+                    pass
+            else:
+                self.fallback_note = ""
             if text:
                 text = text[0].upper() + text[1:]
                 self.paste(text + " ")
-        except sr.UnknownValueError:
-            log("Gap tushunilmadi")
-        except sr.RequestError as e:
-            log(f"Internet/Google xatosi: {e}")
-            self.set_state(ICON_IDLE, "Internet yo'q yoki Google javob bermadi")
-            try:
-                self.tray.notify("Internet yo'q yoki Google javob bermadi.", "OvozMatn")
-            except Exception:
-                pass
-            return
         except Exception:
             log("Xato:\n" + traceback.format_exc())
         self.idle()
