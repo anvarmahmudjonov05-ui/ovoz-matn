@@ -40,9 +40,13 @@ def fatal(msg):
         pass
 
 
+import io
+import json
 import threading
+import wave
 
 try:
+    import requests
     import keyboard
     import numpy as np
     import pyperclip
@@ -60,6 +64,57 @@ LANGUAGE = "uz-UZ"
 SAMPLE_RATE = 16000
 MIN_SECONDS = 0.4        # bundan qisqa yozuv e'tiborga olinmaydi
 # --------------------------------------------
+
+CONFIG_PATH = os.path.join(LOG_DIR, "sozlamalar.json")
+DEFAULT_CONFIG = {
+    "elevenlabs_api_key": "",
+    "elevenlabs_til": "uzb",
+}
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    try:
+        if not os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(DEFAULT_CONFIG, f, indent=2, ensure_ascii=False)
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            cfg.update(json.load(f))
+    except Exception:
+        log("Sozlamalarni o'qib bo'lmadi:\n" + traceback.format_exc())
+    return cfg
+
+
+def open_config():
+    load_config()
+    try:
+        os.startfile(CONFIG_PATH)
+    except Exception:
+        log("Sozlamalar faylini ochib bo'lmadi")
+
+
+def pcm_to_wav(pcm_bytes):
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SAMPLE_RATE)
+        w.writeframes(pcm_bytes)
+    return buf.getvalue()
+
+
+def elevenlabs_text(pcm_bytes, api_key, lang):
+    r = requests.post(
+        "https://api.elevenlabs.io/v1/speech-to-text",
+        headers={"xi-api-key": api_key},
+        files={"file": ("audio.wav", pcm_to_wav(pcm_bytes), "audio/wav")},
+        data={"model_id": "scribe_v2", "language_code": lang, "tag_audio_events": "false"},
+        timeout=30,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"ElevenLabs {r.status_code}: {r.text[:300]}")
+    return r.json().get("text", "").strip()
+
 
 APP_NAME = "OvozMatn"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -121,6 +176,7 @@ class VoiceTyper:
                     self.toggle_autostart,
                     checked=lambda item: autostart_enabled(),
                 ),
+                pystray.MenuItem("Sozlamalar (ElevenLabs kalit)", lambda icon, item: open_config()),
                 pystray.MenuItem("Chiqish", self.quit),
             ),
         )
@@ -189,8 +245,23 @@ class VoiceTyper:
         self.set_state(ICON_BUSY, "Matnga o'girilmoqda...")
         try:
             pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
-            data = sr.AudioData(pcm, SAMPLE_RATE, 2)
-            text = self.recognizer.recognize_google(data, language=LANGUAGE).strip()
+            text = ""
+            cfg = load_config()
+            key = (cfg.get("elevenlabs_api_key") or "").strip()
+            done = False
+            if key:
+                try:
+                    text = elevenlabs_text(pcm, key, cfg.get("elevenlabs_til") or "uzb")
+                    done = True
+                except Exception:
+                    log("ElevenLabs xatosi, Google ishlatiladi:\n" + traceback.format_exc())
+                    try:
+                        self.tray.notify("ElevenLabs ishlamadi (kalit/internet?). Google ishlatildi.", "OvozMatn")
+                    except Exception:
+                        pass
+            if not done:
+                data = sr.AudioData(pcm, SAMPLE_RATE, 2)
+                text = self.recognizer.recognize_google(data, language=LANGUAGE).strip()
             if text:
                 text = text[0].upper() + text[1:]
                 self.paste(text + " ")
