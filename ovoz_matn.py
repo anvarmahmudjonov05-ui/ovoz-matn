@@ -1,44 +1,74 @@
 """
 Ovoz -> Matn (Windows)
 Ctrl+Shift tugmalarini USHLAB TURING -> gapiring -> qo'yib yuboring.
-Matn avtomatik ravishda hozir faol turgan oynaga (Word, Telegram, brauzer...) yoziladi.
+Matn avtomatik ravishda faol turgan oynaga (Word, Telegram, brauzer...) yoziladi.
 
-Ovoz tanish: faster-whisper (lokal, internetsiz, o'zbek tilini qo'llaydi).
+Ovoz tanish: Google nutq tanish xizmati (internet kerak).
 """
 import os
 import sys
-import threading
 import time
+import traceback
 
-import keyboard
-import numpy as np
-import pyperclip
-import pystray
-import sounddevice as sd
-from faster_whisper import WhisperModel
-from PIL import Image, ImageDraw
+# --- Log fayl: %LOCALAPPDATA%\OvozMatn\log.txt ---
+LOG_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "OvozMatn")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_PATH = os.path.join(LOG_DIR, "log.txt")
+try:
+    _log = open(LOG_PATH, "a", encoding="utf-8", buffering=1)
+    sys.stdout = _log
+    sys.stderr = _log
+except Exception:
+    pass
+
+
+def log(msg):
+    try:
+        print(time.strftime("%H:%M:%S"), msg, flush=True)
+    except Exception:
+        pass
+
+
+def fatal(msg):
+    log(msg)
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(
+            0, f"{msg}\n\nLog fayl:\n{LOG_PATH}", "OvozMatn xatosi", 0x10
+        )
+    except Exception:
+        pass
+
+
+import threading
+
+try:
+    import keyboard
+    import numpy as np
+    import pyperclip
+    import pystray
+    import sounddevice as sd
+    import speech_recognition as sr
+    from PIL import Image, ImageDraw
+except Exception:
+    fatal("Kutubxona yuklanmadi:\n" + traceback.format_exc()[-600:])
+    sys.exit(1)
 
 # ---------------- SOZLAMALAR ----------------
-MODEL_SIZE = "small"     # tiny / base / small / medium / large-v3  (kattasi aniqroq, lekin sekinroq)
-LANGUAGE = "uz"          # "uz" - o'zbek, "ru" - rus, "en" - ingliz, None - avtomatik aniqlash
+# "uz-UZ" o'zbek, "ru-RU" rus, "en-US" ingliz
+LANGUAGE = "uz-UZ"
 SAMPLE_RATE = 16000
 MIN_SECONDS = 0.4        # bundan qisqa yozuv e'tiborga olinmaydi
 # --------------------------------------------
 
-
 APP_NAME = "OvozMatn"
-
-
-def resource_path(rel):
-    """.exe ichiga joylangan fayllarga yo'l (PyInstaller) yoki oddiy papka."""
-    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, rel)
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 
 def autostart_enabled():
     try:
         import winreg
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run") as k:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
             winreg.QueryValueEx(k, APP_NAME)
             return True
     except Exception:
@@ -47,9 +77,10 @@ def autostart_enabled():
 
 def set_autostart(enable):
     import winreg
-    path = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__)
-    cmd = f'"{path}"' if getattr(sys, "frozen", False) else f'"{sys.executable}" "{path}"'
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_SET_VALUE) as k:
+    frozen = getattr(sys, "frozen", False)
+    path = sys.executable if frozen else os.path.abspath(__file__)
+    cmd = f'"{path}"' if frozen else f'"{sys.executable}" "{path}"'
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
         if enable:
             winreg.SetValueEx(k, APP_NAME, 0, winreg.REG_SZ, cmd)
         else:
@@ -66,23 +97,24 @@ def make_icon(color):
     return img
 
 
-ICON_LOADING = make_icon("orange")
+ICON_BUSY = make_icon("orange")
 ICON_IDLE = make_icon("green")
 ICON_REC = make_icon("red")
+READY = "Tayyor: Ctrl+Shift ni ushlab gapiring"
 
 
 class VoiceTyper:
     def __init__(self):
-        self.model = None
         self.recording = False
         self.frames = []
         self.stream = None
         self.started_at = 0.0
         self.lock = threading.Lock()
+        self.recognizer = sr.Recognizer()
         self.tray = pystray.Icon(
             "ovoz_matn",
-            ICON_LOADING,
-            "Model yuklanmoqda...",
+            ICON_IDLE,
+            READY,
             menu=pystray.Menu(
                 pystray.MenuItem(
                     "Windows bilan birga ochilsin",
@@ -93,20 +125,9 @@ class VoiceTyper:
             ),
         )
 
-    # ---------- holat ----------
     def set_state(self, icon, title):
         self.tray.icon = icon
         self.tray.title = title
-
-    # ---------- model ----------
-    def load_model(self):
-        try:
-            bundled = resource_path("model")
-            source = bundled if os.path.isdir(bundled) else MODEL_SIZE
-            self.model = WhisperModel(source, device="cpu", compute_type="int8")
-            self.set_state(ICON_IDLE, "Tayyor: Ctrl+Shift ni ushlab gapiring")
-        except Exception as e:
-            self.set_state(ICON_LOADING, f"Xato: {e}")
 
     # ---------- yozib olish ----------
     def _audio_cb(self, indata, frames, time_info, status):
@@ -115,15 +136,21 @@ class VoiceTyper:
 
     def start_recording(self):
         with self.lock:
-            if self.recording or self.model is None:
+            if self.recording:
                 return
             self.frames = []
             self.recording = True
             self.started_at = time.time()
-            self.stream = sd.InputStream(
-                samplerate=SAMPLE_RATE, channels=1, dtype="float32", callback=self._audio_cb
-            )
-            self.stream.start()
+            try:
+                self.stream = sd.InputStream(
+                    samplerate=SAMPLE_RATE, channels=1, dtype="float32", callback=self._audio_cb
+                )
+                self.stream.start()
+            except Exception:
+                self.recording = False
+                log("Mikrofon xatosi:\n" + traceback.format_exc())
+                self.set_state(ICON_IDLE, "Mikrofon topilmadi")
+                return
             self.set_state(ICON_REC, "Yozilmoqda...")
 
     def cancel_recording(self):
@@ -132,7 +159,7 @@ class VoiceTyper:
                 return
             self.recording = False
             self._close_stream()
-            self.set_state(ICON_IDLE, "Tayyor: Ctrl+Shift ni ushlab gapiring")
+            self.set_state(ICON_IDLE, READY)
 
     def stop_recording(self):
         with self.lock:
@@ -143,7 +170,7 @@ class VoiceTyper:
             frames = self.frames
             duration = time.time() - self.started_at
         if duration < MIN_SECONDS or not frames:
-            self.set_state(ICON_IDLE, "Tayyor: Ctrl+Shift ni ushlab gapiring")
+            self.set_state(ICON_IDLE, READY)
             return
         audio = np.concatenate(frames).flatten()
         threading.Thread(target=self.transcribe_and_type, args=(audio,), daemon=True).start()
@@ -159,18 +186,27 @@ class VoiceTyper:
 
     # ---------- matnga o'girish va yozish ----------
     def transcribe_and_type(self, audio):
-        self.set_state(ICON_LOADING, "Matnga o'girilmoqda...")
+        self.set_state(ICON_BUSY, "Matnga o'girilmoqda...")
         try:
-            segments, _ = self.model.transcribe(
-                audio, language=LANGUAGE, beam_size=5, vad_filter=True
-            )
-            text = " ".join(s.text.strip() for s in segments).strip()
+            pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+            data = sr.AudioData(pcm, SAMPLE_RATE, 2)
+            text = self.recognizer.recognize_google(data, language=LANGUAGE).strip()
             if text:
+                text = text[0].upper() + text[1:]
                 self.paste(text + " ")
-        except Exception as e:
-            print("Xato:", e)
-        finally:
-            self.set_state(ICON_IDLE, "Tayyor: Ctrl+Shift ni ushlab gapiring")
+        except sr.UnknownValueError:
+            log("Gap tushunilmadi")
+        except sr.RequestError as e:
+            log(f"Internet/Google xatosi: {e}")
+            self.set_state(ICON_IDLE, "Internet yo'q yoki Google javob bermadi")
+            try:
+                self.tray.notify("Internet yo'q yoki Google javob bermadi.", "OvozMatn")
+            except Exception:
+                pass
+            return
+        except Exception:
+            log("Xato:\n" + traceback.format_exc())
+        self.set_state(ICON_IDLE, READY)
 
     def paste(self, text):
         try:
@@ -182,7 +218,7 @@ class VoiceTyper:
         keyboard.send("ctrl+v")
         time.sleep(0.2)
         if old is not None:
-            pyperclip.copy(old)  # eski clipboard qaytariladi
+            pyperclip.copy(old)
 
     # ---------- klaviatura ----------
     def on_key(self, e):
@@ -190,7 +226,7 @@ class VoiceTyper:
         is_mod = "ctrl" in name or "shift" in name
         if e.event_type == "down":
             if self.recording and not is_mod:
-                self.cancel_recording()  # boshqa tugma bosildi (masalan Ctrl+Shift+T)
+                self.cancel_recording()
             elif not self.recording and keyboard.is_pressed("ctrl") and keyboard.is_pressed("shift"):
                 self.start_recording()
         elif e.event_type == "up" and is_mod and self.recording:
@@ -199,18 +235,28 @@ class VoiceTyper:
     def toggle_autostart(self, icon, item):
         try:
             set_autostart(not autostart_enabled())
-        except Exception as e:
-            print("Avtoyuklash xatosi:", e)
+        except Exception:
+            log("Avtoyuklash xatosi:\n" + traceback.format_exc())
 
     def quit(self, *_):
         keyboard.unhook_all()
         self.tray.stop()
 
+    def _setup(self, icon):
+        icon.visible = True
+        try:
+            icon.notify("Tayyor! Ctrl+Shift ni ushlab gapiring.", "OvozMatn")
+        except Exception:
+            pass
+
     def run(self):
+        log("Ilova ishga tushdi")
         keyboard.hook(self.on_key)
-        threading.Thread(target=self.load_model, daemon=True).start()
-        self.tray.run()
+        self.tray.run(setup=self._setup)
 
 
 if __name__ == "__main__":
-    VoiceTyper().run()
+    try:
+        VoiceTyper().run()
+    except Exception:
+        fatal("Ilova to'xtadi:\n" + traceback.format_exc()[-600:])
