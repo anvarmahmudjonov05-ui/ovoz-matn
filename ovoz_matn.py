@@ -155,6 +155,7 @@ def make_icon(color):
 ICON_BUSY = make_icon("orange")
 ICON_IDLE = make_icon("green")
 ICON_REC = make_icon("red")
+ICON_EL = make_icon("royalblue")
 READY = "Tayyor: Ctrl+Shift ni ushlab gapiring"
 
 
@@ -165,12 +166,14 @@ class VoiceTyper:
         self.stream = None
         self.started_at = 0.0
         self.lock = threading.Lock()
+        self.last_engine = None
         self.recognizer = sr.Recognizer()
         self.tray = pystray.Icon(
             "ovoz_matn",
             ICON_IDLE,
             READY,
             menu=pystray.Menu(
+                pystray.MenuItem(lambda item: self.engine_text(), None, enabled=False),
                 pystray.MenuItem(
                     "Windows bilan birga ochilsin",
                     self.toggle_autostart,
@@ -180,6 +183,28 @@ class VoiceTyper:
                 pystray.MenuItem("Chiqish", self.quit),
             ),
         )
+
+    def configured_engine(self):
+        key = (load_config().get("elevenlabs_api_key") or "").strip()
+        return "ElevenLabs" if key else "Google"
+
+    def engine_text(self):
+        cur = self.configured_engine()
+        txt = f"Ishlayapti: {cur}"
+        if self.last_engine and self.last_engine != cur:
+            txt += f" (oxirgi matn: {self.last_engine})"
+        elif self.last_engine == "Google (zaxira)":
+            txt = "Oxirgi matn: Google (ElevenLabs ishlamadi)"
+        return txt
+
+    def idle(self):
+        eng = self.configured_engine()
+        if self.last_engine == "Google (zaxira)":
+            self.set_state(ICON_BUSY, "ElevenLabs ishlamadi -> Google ishlatildi")
+        elif eng == "ElevenLabs":
+            self.set_state(ICON_EL, "Tayyor [ElevenLabs]: Ctrl+Shift ni ushlab gapiring")
+        else:
+            self.set_state(ICON_IDLE, "Tayyor [Google]: Ctrl+Shift ni ushlab gapiring")
 
     def set_state(self, icon, title):
         self.tray.icon = icon
@@ -215,7 +240,7 @@ class VoiceTyper:
                 return
             self.recording = False
             self._close_stream()
-            self.set_state(ICON_IDLE, READY)
+            self.idle()
 
     def stop_recording(self):
         with self.lock:
@@ -226,7 +251,7 @@ class VoiceTyper:
             frames = self.frames
             duration = time.time() - self.started_at
         if duration < MIN_SECONDS or not frames:
-            self.set_state(ICON_IDLE, READY)
+            self.idle()
             return
         audio = np.concatenate(frames).flatten()
         threading.Thread(target=self.transcribe_and_type, args=(audio,), daemon=True).start()
@@ -253,6 +278,7 @@ class VoiceTyper:
                 try:
                     text = elevenlabs_text(pcm, key, cfg.get("elevenlabs_til") or "uzb")
                     done = True
+                    self.last_engine = "ElevenLabs"
                 except Exception:
                     log("ElevenLabs xatosi, Google ishlatiladi:\n" + traceback.format_exc())
                     try:
@@ -260,6 +286,7 @@ class VoiceTyper:
                     except Exception:
                         pass
             if not done:
+                self.last_engine = "Google (zaxira)" if key else "Google"
                 data = sr.AudioData(pcm, SAMPLE_RATE, 2)
                 text = self.recognizer.recognize_google(data, language=LANGUAGE).strip()
             if text:
@@ -277,7 +304,7 @@ class VoiceTyper:
             return
         except Exception:
             log("Xato:\n" + traceback.format_exc())
-        self.set_state(ICON_IDLE, READY)
+        self.idle()
 
     def paste(self, text):
         try:
@@ -315,8 +342,9 @@ class VoiceTyper:
 
     def _setup(self, icon):
         icon.visible = True
+        self.idle()
         try:
-            icon.notify("Tayyor! Ctrl+Shift ni ushlab gapiring.", "OvozMatn")
+            icon.notify(f"Tayyor! Xizmat: {self.configured_engine()}. Ctrl+Shift ni ushlab gapiring.", "OvozMatn")
         except Exception:
             pass
 
